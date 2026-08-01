@@ -1,0 +1,218 @@
+name: VPS-SSH
+on: 
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+    
+    steps:
+    - name: Install and Configure SSH Server
+      run: |
+        # Update package list and install SSH server
+        sudo apt-get update
+        sudo apt-get install -y openssh-server net-tools curl wget
+        
+        # Backup original SSH config
+        sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+        
+        # Configure SSH for password authentication and root login
+        sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+        sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+        sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+        
+        # Create custom SSH config with specific settings
+        sudo tee -a /etc/ssh/sshd_config > /dev/null <<EOT
+        # Custom settings for VPS access
+        ClientAliveInterval 60
+        ClientAliveCountMax 3
+        MaxSessions 10
+        MaxStartups 10:30:100
+        GatewayPorts yes
+        AllowTcpForwarding yes
+        X11Forwarding yes
+        EOT
+        
+        # Restart SSH service
+        sudo systemctl restart ssh
+        sudo systemctl enable ssh
+        
+        # Check SSH status
+        sudo systemctl status ssh --no-pager
+
+    - name: Create SSH User with Secure Password
+      run: |
+        # Generate secure random password
+        PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-24)
+        
+        # Create user with home directory
+        sudo useradd -m -s /bin/bash -G sudo vpsuser
+        
+        # Set password
+        echo "vpsuser:$PASSWORD" | sudo chpasswd
+        
+        # Create .ssh directory for future key-based auth
+        sudo mkdir -p /home/vpsuser/.ssh
+        sudo chmod 700 /home/vpsuser/.ssh
+        sudo chown -R vpsuser:vpsuser /home/vpsuser/.ssh
+        
+        # Save credentials to environment
+        echo "SSH_CREDS=Username: vpsuser | Password: $PASSWORD" >> $GITHUB_ENV
+        echo "SSH_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+        
+        # Save to file for later use
+        echo "Username: vpsuser" > /tmp/ssh_creds.txt
+        echo "Password: $PASSWORD" >> /tmp/ssh_creds.txt
+        echo "Port: 22" >> /tmp/ssh_creds.txt
+
+    - name: Install and Configure Tailscale
+      run: |
+        # Install Tailscale
+        curl -fsSL https://tailscale.com/install.sh | sudo bash
+        
+        # Start Tailscale with auth key
+        sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ssh-runner-$GITHUB_RUN_ID
+        
+        # Wait for Tailscale IP
+        sleep 10
+        
+        # Get Tailscale IP
+        TS_IP=$(sudo tailscale ip -4)
+        echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+        
+        # Also get hostname and other details
+        TS_HOSTNAME=$(sudo tailscale status | grep -o 'gh-ssh-runner-[0-9]*' | head -1)
+        echo "TAILSCALE_HOSTNAME=$TS_HOSTNAME" >> $GITHUB_ENV
+
+    - name: Configure Firewall and Port Forwarding
+      run: |
+        # Allow SSH through UFW if present
+        sudo ufw allow 22/tcp || true
+        sudo ufw allow 22 || true
+        
+        # Or using iptables
+        sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT || true
+        
+        # Create additional user with sudo access
+        sudo usermod -aG sudo vpsuser
+        
+        # Set up SSH key-based authentication (optional but recommended)
+        # This creates a key pair for passwordless access
+        sudo -u vpsuser ssh-keygen -t rsa -b 4096 -f /home/vpsuser/.ssh/id_rsa -N ""
+        
+        # Add public key to authorized_keys
+        sudo cp /home/vpsuser/.ssh/id_rsa.pub /home/vpsuser/.ssh/authorized_keys
+        sudo chmod 600 /home/vpsuser/.ssh/authorized_keys
+        sudo chown vpsuser:vpsuser /home/vpsuser/.ssh/authorized_keys
+
+    - name: Install Additional Tools
+      run: |
+        # Install useful tools for VPS environment
+        sudo apt-get install -y \
+          htop \
+          vim \
+          tmux \
+          git \
+          curl \
+          wget \
+          net-tools \
+          dnsutils \
+          traceroute \
+          mc \
+          screen
+        
+        # Install Docker if needed
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sudo sh get-docker.sh
+        sudo usermod -aG docker vpsuser
+        
+        # Install Node.js and PM2 for web server options
+        curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+        sudo npm install -g pm2
+
+    - name: Setup Web Server (Optional)
+      run: |
+        # Create a simple status page
+        sudo mkdir -p /var/www/html
+        echo "<h1>GitHub Actions VPS via Tailscale</h1>" | sudo tee /var/www/html/index.html
+        echo "<p>SSH Access: ssh vpsuser@${{ env.TAILSCALE_IP }}</p>" | sudo tee -a /var/www/html/index.html
+        echo "<p>Connected via: Tailscale</p>" | sudo tee -a /var/www/html/index.html
+
+    - name: Verify SSH Accessibility
+      run: |
+        # Test SSH locally
+        echo "Testing SSH connectivity..."
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no vpsuser@localhost "echo 'SSH connection successful!'"
+        
+        if [ $? -eq 0 ]; then
+          echo "SSH service is running properly!"
+        else
+          echo "WARNING: SSH service may not be configured correctly"
+          exit 1
+        fi
+        
+        # Test from localhost via Tailscale IP
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -p 22 vpsuser@${{ env.TAILSCALE_IP }} "echo 'SSH via Tailscale IP successful!'"
+
+    - name: Create Connection Script
+      run: |
+        # Create a connection helper script
+        sudo tee /home/vpsuser/connect.sh > /dev/null <<'EOT'
+        #!/bin/bash
+        echo "=== SSH VPS ACCESS INFORMATION ==="
+        echo "IP Address: ${{ env.TAILSCALE_IP }}"
+        echo "Username: vpsuser"
+        echo "Password: ${{ env.SSH_PASSWORD }}"
+        echo "=================================="
+        echo ""
+        echo "To connect:"
+        echo "ssh vpsuser@${{ env.TAILSCALE_IP }}"
+        echo ""
+        echo "Password: ${{ env.SSH_PASSWORD }}"
+        echo ""
+        echo "For better security, you can use the SSH key:"
+        echo "ssh -i ~/.ssh/id_rsa vpsuser@${{ env.TAILSCALE_IP }}"
+        EOT
+        
+        sudo chmod +x /home/vpsuser/connect.sh
+        sudo chown vpsuser:vpsuser /home/vpsuser/connect.sh
+
+    - name: Maintain Connection
+      run: |
+        # Display connection information
+        echo "========================================="
+        echo "   SSH VPS ACCESS VIA TAILSCALE"
+        echo "========================================="
+        echo "IP Address: ${{ env.TAILSCALE_IP }}"
+        echo "Username: vpsuser"
+        echo "Password: ${{ env.SSH_PASSWORD }}"
+        echo "-----------------------------------------"
+        echo "Connection Command:"
+        echo "ssh vpsuser@${{ env.TAILSCALE_IP }}"
+        echo "========================================="
+        
+        # Save credentials to GitHub output
+        echo "::set-output name=ssh_command::ssh vpsuser@${{ env.TAILSCALE_IP }}"
+        
+        # Print SSH credentials to workflow logs
+        echo "Username: vpsuser"
+        echo "Password: ${{ env.SSH_PASSWORD }}"
+        echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
+        echo ""
+        echo "🔑 SSH Access: ssh vpsuser@${{ env.TAILSCALE_IP }}"
+        echo "📌 Password: ${{ env.SSH_PASSWORD }}"
+        
+        # Keep the runner alive
+        echo "VPS is now active! Use Ctrl+C to terminate in workflow UI"
+        echo "Press Ctrl+C in GitHub Actions interface to stop"
+        
+        # Long-running process to keep the workflow alive
+        while true; do
+          echo "[$(date)] VPS SSH Active - IP: ${{ env.TAILSCALE_IP }}"
+          echo "SSH: ssh vpsuser@${{ env.TAILSCALE_IP }}"
+          echo "Password: ${{ env.SSH_PASSWORD }}"
+          echo "---"
+          sleep 300
+        done
