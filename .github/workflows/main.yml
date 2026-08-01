@@ -1,218 +1,238 @@
-name: VPS-SSH
+name: Dual-Access-RDP-SSH
 on: 
   workflow_dispatch:
 
 jobs:
-  secure-ssh:
+  # JOB 1: Windows RDP Access
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    
+    steps:
+    - name: Configure RDP
+      run: |
+        # Enable Remote Desktop
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+        
+        # Firewall rule for RDP
+        netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+        netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+        
+        # Restart RDP service
+        Restart-Service -Name TermService -Force
+        
+        # Check if RDP is enabled
+        $rdpStatus = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections"
+        if ($rdpStatus.fDenyTSConnections -eq 0) {
+          Write-Host "RDP enabled successfully!"
+        } else {
+          Write-Error "RDP enabling failed"
+          exit 1
+        }
+
+    - name: Create RDP User
+      run: |
+        # Generate secure password
+        Add-Type -AssemblyName System.Security
+        $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-='
+        $password = -join ((1..20) | ForEach { Get-Random -Maximum $chars.Length | ForEach { $chars[$_] } })
+        
+        $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+        
+        # Create user
+        New-LocalUser -Name "rdpuser" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+        
+        # Add to groups
+        Add-LocalGroupMember -Group "Administrators" -Member "rdpuser" -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "rdpuser" -ErrorAction SilentlyContinue
+        
+        # Save credentials
+        echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+        echo "RDP_USER=rdpuser" >> $env:GITHUB_ENV
+
+    - name: Install Tailscale
+      run: |
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $installerPath = "$env:TEMP\tailscale.msi"
+        Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+        Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+        Remove-Item $installerPath -Force
+
+    - name: Connect Tailscale
+      run: |
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-$env:GITHUB_RUN_ID
+        
+        # Get Tailscale IP
+        $retries = 0
+        $tsIP = $null
+        while (-not $tsIP -and $retries -lt 15) {
+          Start-Sleep -Seconds 5
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $retries++
+        }
+        
+        if ($tsIP) {
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+        } else {
+          Write-Error "Failed to get Tailscale IP"
+          exit 1
+        }
+
+    - name: RDP Access Info
+      run: |
+        Clear-Host
+        Write-Host "`n========================================="
+        Write-Host "   🖥️  RDP ACCESS INFORMATION"
+        Write-Host "========================================="
+        Write-Host "Address: $env:TAILSCALE_IP:3389"
+        Write-Host "Username: rdpuser"
+        Write-Host "Password: $env:RDP_PASSWORD"
+        Write-Host "========================================="
+        Write-Host "`nUse Windows Remote Desktop Connection"
+        Write-Host "or any RDP client to connect.`n"
+        
+        # Keep alive
+        while ($true) {
+          Write-Host "[$(Get-Date)] RDP Active - IP: $env:TAILSCALE_IP"
+          Start-Sleep -Seconds 300
+        }
+
+  # JOB 2: Linux SSH Access (VPS)
+  linux-ssh:
     runs-on: ubuntu-latest
     timeout-minutes: 3600
     
     steps:
-    - name: Install and Configure SSH Server
+    - name: Install SSH Server
       run: |
-        # Update package list and install SSH server
+        # Install SSH
         sudo apt-get update
-        sudo apt-get install -y openssh-server net-tools curl wget
+        sudo apt-get install -y openssh-server
         
-        # Backup original SSH config
-        sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-        
-        # Configure SSH for password authentication and root login
+        # Configure SSH
         sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
         sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
         sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
         
-        # Create custom SSH config with specific settings
+        # Additional settings
         sudo tee -a /etc/ssh/sshd_config > /dev/null <<EOT
-        # Custom settings for VPS access
         ClientAliveInterval 60
         ClientAliveCountMax 3
-        MaxSessions 10
-        MaxStartups 10:30:100
-        GatewayPorts yes
         AllowTcpForwarding yes
         X11Forwarding yes
         EOT
         
-        # Restart SSH service
-        sudo systemctl restart ssh
+        # Start SSH service
         sudo systemctl enable ssh
+        sudo systemctl start ssh
+        sleep 2
         
-        # Check SSH status
-        sudo systemctl status ssh --no-pager
+        # Verify SSH is running
+        if sudo systemctl is-active --quiet ssh; then
+          echo "SSH started successfully!"
+        else
+          echo "SSH failed to start!"
+          sudo systemctl status ssh --no-pager
+          exit 1
+        fi
 
-    - name: Create SSH User with Secure Password
+    - name: Create SSH User
       run: |
-        # Generate secure random password
-        PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-24)
+        # Generate password
+        PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-20)
         
-        # Create user with home directory
-        sudo useradd -m -s /bin/bash -G sudo vpsuser
+        # Create user with sudo
+        sudo useradd -m -s /bin/bash -G sudo sshuser
         
         # Set password
-        echo "vpsuser:$PASSWORD" | sudo chpasswd
+        echo "sshuser:$PASSWORD" | sudo chpasswd
         
-        # Create .ssh directory for future key-based auth
-        sudo mkdir -p /home/vpsuser/.ssh
-        sudo chmod 700 /home/vpsuser/.ssh
-        sudo chown -R vpsuser:vpsuser /home/vpsuser/.ssh
+        # Setup SSH directory
+        sudo mkdir -p /home/sshuser/.ssh
+        sudo chmod 700 /home/sshuser/.ssh
+        sudo chown -R sshuser:sshuser /home/sshuser/.ssh
         
-        # Save credentials to environment
-        echo "SSH_CREDS=Username: vpsuser | Password: $PASSWORD" >> $GITHUB_ENV
+        # Save credentials
+        echo "SSH_USER=sshuser" >> $GITHUB_ENV
         echo "SSH_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-        
-        # Save to file for later use
-        echo "Username: vpsuser" > /tmp/ssh_creds.txt
-        echo "Password: $PASSWORD" >> /tmp/ssh_creds.txt
-        echo "Port: 22" >> /tmp/ssh_creds.txt
+        echo "SSH_CREDS=Username: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
 
-    - name: Install and Configure Tailscale
+    - name: Install Tailscale
       run: |
-        # Install Tailscale
         curl -fsSL https://tailscale.com/install.sh | sudo bash
+
+    - name: Connect Tailscale
+      run: |
+        # Start Tailscale
+        sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ssh-$GITHUB_RUN_ID
         
-        # Start Tailscale with auth key
-        sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ssh-runner-$GITHUB_RUN_ID
-        
-        # Wait for Tailscale IP
+        # Get IP
         sleep 10
-        
-        # Get Tailscale IP
         TS_IP=$(sudo tailscale ip -4)
-        echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
         
-        # Also get hostname and other details
-        TS_HOSTNAME=$(sudo tailscale status | grep -o 'gh-ssh-runner-[0-9]*' | head -1)
-        echo "TAILSCALE_HOSTNAME=$TS_HOSTNAME" >> $GITHUB_ENV
+        if [ -n "$TS_IP" ]; then
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TS_IP"
+        else
+          echo "Failed to get Tailscale IP"
+          exit 1
+        fi
 
-    - name: Configure Firewall and Port Forwarding
+    - name: Verify SSH Access
       run: |
-        # Allow SSH through UFW if present
-        sudo ufw allow 22/tcp || true
-        sudo ufw allow 22 || true
+        # Test local SSH
+        echo "Testing SSH locally..."
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no sshuser@localhost "echo 'SSH OK'"
         
-        # Or using iptables
-        sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT || true
-        
-        # Create additional user with sudo access
-        sudo usermod -aG sudo vpsuser
-        
-        # Set up SSH key-based authentication (optional but recommended)
-        # This creates a key pair for passwordless access
-        sudo -u vpsuser ssh-keygen -t rsa -b 4096 -f /home/vpsuser/.ssh/id_rsa -N ""
-        
-        # Add public key to authorized_keys
-        sudo cp /home/vpsuser/.ssh/id_rsa.pub /home/vpsuser/.ssh/authorized_keys
-        sudo chmod 600 /home/vpsuser/.ssh/authorized_keys
-        sudo chown vpsuser:vpsuser /home/vpsuser/.ssh/authorized_keys
+        if [ $? -eq 0 ]; then
+          echo "SSH service verified!"
+        else
+          echo "SSH verification failed!"
+          sudo systemctl status ssh --no-pager
+          exit 1
+        fi
 
-    - name: Install Additional Tools
+    - name: Install Tools (Optional)
       run: |
-        # Install useful tools for VPS environment
-        sudo apt-get install -y \
-          htop \
-          vim \
-          tmux \
-          git \
-          curl \
-          wget \
-          net-tools \
-          dnsutils \
-          traceroute \
-          mc \
-          screen
+        sudo apt-get install -y htop vim tmux git curl wget net-tools dnsutils
         
-        # Install Docker if needed
+        # Install Docker
         curl -fsSL https://get.docker.com -o get-docker.sh
         sudo sh get-docker.sh
-        sudo usermod -aG docker vpsuser
+        sudo usermod -aG docker sshuser
         
-        # Install Node.js and PM2 for web server options
+        # Install Node.js
         curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
         sudo apt-get install -y nodejs
         sudo npm install -g pm2
 
-    - name: Setup Web Server (Optional)
+    - name: SSH Access Info
       run: |
-        # Create a simple status page
-        sudo mkdir -p /var/www/html
-        echo "<h1>GitHub Actions VPS via Tailscale</h1>" | sudo tee /var/www/html/index.html
-        echo "<p>SSH Access: ssh vpsuser@${{ env.TAILSCALE_IP }}</p>" | sudo tee -a /var/www/html/index.html
-        echo "<p>Connected via: Tailscale</p>" | sudo tee -a /var/www/html/index.html
-
-    - name: Verify SSH Accessibility
-      run: |
-        # Test SSH locally
-        echo "Testing SSH connectivity..."
-        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no vpsuser@localhost "echo 'SSH connection successful!'"
-        
-        if [ $? -eq 0 ]; then
-          echo "SSH service is running properly!"
-        else
-          echo "WARNING: SSH service may not be configured correctly"
-          exit 1
-        fi
-        
-        # Test from localhost via Tailscale IP
-        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -p 22 vpsuser@${{ env.TAILSCALE_IP }} "echo 'SSH via Tailscale IP successful!'"
-
-    - name: Create Connection Script
-      run: |
-        # Create a connection helper script
-        sudo tee /home/vpsuser/connect.sh > /dev/null <<'EOT'
-        #!/bin/bash
-        echo "=== SSH VPS ACCESS INFORMATION ==="
-        echo "IP Address: ${{ env.TAILSCALE_IP }}"
-        echo "Username: vpsuser"
-        echo "Password: ${{ env.SSH_PASSWORD }}"
-        echo "=================================="
-        echo ""
-        echo "To connect:"
-        echo "ssh vpsuser@${{ env.TAILSCALE_IP }}"
-        echo ""
-        echo "Password: ${{ env.SSH_PASSWORD }}"
-        echo ""
-        echo "For better security, you can use the SSH key:"
-        echo "ssh -i ~/.ssh/id_rsa vpsuser@${{ env.TAILSCALE_IP }}"
-        EOT
-        
-        sudo chmod +x /home/vpsuser/connect.sh
-        sudo chown vpsuser:vpsuser /home/vpsuser/connect.sh
-
-    - name: Maintain Connection
-      run: |
-        # Display connection information
         echo "========================================="
-        echo "   SSH VPS ACCESS VIA TAILSCALE"
+        echo "   🔐 SSH VPS ACCESS INFORMATION"
         echo "========================================="
-        echo "IP Address: ${{ env.TAILSCALE_IP }}"
-        echo "Username: vpsuser"
+        echo "IP: ${{ env.TAILSCALE_IP }}"
+        echo "Port: 22"
+        echo "Username: ${{ env.SSH_USER }}"
         echo "Password: ${{ env.SSH_PASSWORD }}"
-        echo "-----------------------------------------"
-        echo "Connection Command:"
-        echo "ssh vpsuser@${{ env.TAILSCALE_IP }}"
+        echo "========================================="
+        echo ""
+        echo "Connect using:"
+        echo "ssh ${{ env.SSH_USER }}@${{ env.TAILSCALE_IP }}"
+        echo ""
+        echo "Password: ${{ env.SSH_PASSWORD }}"
+        echo ""
         echo "========================================="
         
-        # Save credentials to GitHub output
-        echo "::set-output name=ssh_command::ssh vpsuser@${{ env.TAILSCALE_IP }}"
+        # Show service status
+        sudo systemctl status ssh --no-pager
         
-        # Print SSH credentials to workflow logs
-        echo "Username: vpsuser"
-        echo "Password: ${{ env.SSH_PASSWORD }}"
-        echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
-        echo ""
-        echo "🔑 SSH Access: ssh vpsuser@${{ env.TAILSCALE_IP }}"
-        echo "📌 Password: ${{ env.SSH_PASSWORD }}"
-        
-        # Keep the runner alive
-        echo "VPS is now active! Use Ctrl+C to terminate in workflow UI"
-        echo "Press Ctrl+C in GitHub Actions interface to stop"
-        
-        # Long-running process to keep the workflow alive
+        # Keep alive
         while true; do
-          echo "[$(date)] VPS SSH Active - IP: ${{ env.TAILSCALE_IP }}"
-          echo "SSH: ssh vpsuser@${{ env.TAILSCALE_IP }}"
-          echo "Password: ${{ env.SSH_PASSWORD }}"
-          echo "---"
+          echo "[$(date)] SSH VPS Active - IP: ${{ env.TAILSCALE_IP }}"
+          echo "ssh ${{ env.SSH_USER }}@${{ env.TAILSCALE_IP }}"
           sleep 300
         done
